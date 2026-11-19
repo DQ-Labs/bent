@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BENT // Video Bending & Traktor Kontrol F1 Workstation</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Workstation Header & Mode Switcher -->
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-logo">BENT</div>
+        <div class="brand-sub">ANALOG VIDEO SYNTH // TRAKTOR F1 // PIANO ROLL</div>
+      </div>
+
+      <!-- 3 Core Modes: EDIT | PERFORM | PLAYBACK -->
+      <nav class="mode-tabs" role="tablist">
+        <button class="mode-tab active" data-mode="edit">
+          <span class="mode-num">1</span>
+          <span class="mode-label">EDIT</span>
+          <span class="mode-desc">Canvas · Bend · Pad Map</span>
+        </button>
+        <button class="mode-tab" data-mode="perform">
+          <span class="mode-num">2</span>
+          <span class="mode-label">PERFORM</span>
+          <span class="mode-desc">Music · Live F1 · Record</span>
+        </button>
+        <button class="mode-tab" data-mode="playback">
+          <span class="mode-num">3</span>
+          <span class="mode-label">PLAYBACK</span>
+          <span class="mode-desc">Piano Roll · 8 Macro Lanes</span>
+        </button>
+      </nav>
+
+      <!-- Master Transport & Session Controls -->
+      <div class="transport-bar">
+        <button id="btn-play-pause" class="transport-btn play" title="Play / Pause Audio & Timeline [Space]">
+          ▶ PLAY
+        </button>
+        <button id="btn-stop" class="transport-btn" title="Stop & Return to 0:00">
+          ■ STOP
+        </button>
+        <button id="btn-record-take" class="transport-btn record" title="Record Performance Take or Overdub [F1 CAPTURE]">
+          ● REC
+        </button>
+
+        <div class="transport-readout">
+          <div id="timecode-display" class="timecode-text">00.00s</div>
+          <div id="bar-beat-display" class="barbeat-text">BAR 1.1</div>
+        </div>
+
+        <div class="bpm-box">
+          <label for="input-bpm">BPM</label>
+          <input id="input-bpm" type="number" min="40" max="260" step="1" value="128" />
+        </div>
+
+        <div class="project-actions">
+          <button id="btn-open-project" class="action-btn" title="Open .bent Project">Open</button>
+          <button id="btn-save-project" class="action-btn" title="Save .bent Project">Save</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content Grid: Left/Center Workbench + Right Traktor Kontrol F1 Dock -->
+    <main class="workspace-grid">
+      <div class="workbench-column">
+        <!-- Upper Stage Row: Real-Time WebGL2 Circuit-Bent Video Viewport + Live Telemetry -->
+        <section class="stage-section">
+          <div class="viewport-frame">
+            <canvas id="bent-webgl-canvas" width="1280" height="720"></canvas>
+            <div class="viewport-overlay-top">
+              <span id="badge-resolution" class="hud-pill">1920×1080 @ 60 FPS</span>
+              <span id="badge-active-pad" class="hud-pill accent">PAD 1: PM5544 Clean</span>
+              <span id="badge-active-fx" class="hud-pill warn hidden">FX PUNCH ACTIVE</span>
+              <span id="badge-rec-state" class="hud-pill danger hidden">● REC TAKE</span>
+            </div>
+          </div>
+
+          <!-- Compact Stage Side Panel: Live 4-Band Audio FFT + Active Macro Summary -->
+          <div class="stage-telemetry">
+            <div class="panel-header-mini">
+              <span>AUDIO FFT SPECTRUM</span>
+              <span id="audio-track-pill" class="mini-tag">128 BPM Synth</span>
+            </div>
+            <div class="fft-meters">
+              <div class="fft-bar-col">
+                <div class="fft-track"><div id="fft-fill-sub" class="fft-fill sub"></div></div>
+                <span>SUB</span>
+              </div>
+              <div class="fft-bar-col">
+                <div class="fft-track"><div id="fft-fill-kick" class="fft-fill kick"></div></div>
+                <span>KICK</span>
+              </div>
+              <div class="fft-bar-col">
+                <div class="fft-track"><div id="fft-fill-mid" class="fft-fill mid"></div></div>
+                <span>MID</span>
+              </div>
+              <div class="fft-bar-col">
+                <div class="fft-track"><div id="fft-fill-high" class="fft-fill high"></div></div>
+                <span>HIGH</span>
+              </div>
+            </div>
+
+            <div class="panel-header-mini" style="margin-top: 8px;">
+              <span>QUICK ACTIONS</span>
+            </div>
+            <div class="quick-stage-btns">
+              <button id="btn-load-audio-quick" class="action-btn full">♪ Load Music File...</button>
+              <button id="btn-import-video-quick" class="action-btn full">+ Import Video Clips...</button>
+              <button id="btn-clear-feedback" class="action-btn full">Clear Feedback Loop</button>
+              <button id="btn-reset-macros" class="action-btn full">Reset 8 Macros to Default</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================== -->
+        <!-- MODE 1: EDIT MODE WORKBENCH (Canvas, Clip Trim, Bend Lab, Pad Map) -->
+        <!-- =================================================================== -->
+        <section id="mode-panel-edit" class="mode-workbench active">
+          <div class="edit-three-col">
+            <!-- Column 1: Canvas Settings & Selected F1 Pad Assignment -->
+            <div class="card-panel">
+              <div class="card-title">
+                <span>F1 PAD ASSIGNMENT</span>
+                <span id="edit-selected-pad-badge" class="badge-tag">PAD 1 [Key 1]</span>
+              </div>
+
+              <div class="form-grid">
+                <label>Pad Name</label>
+                <input id="edit-pad-name" type="text" maxlength="26" />
+
+                <label>Pad Role (Option B)</label>
+                <select id="edit-pad-role">
+                  <option value="clip">Video Clip Trigger + Bend Preset</option>
+                  <option value="fx">Momentary Circuit-Bend FX Punch</option>
+                </select>
+
+                <label>Trigger Behavior</label>
+                <select id="edit-pad-trigger">
+                  <option value="latch">Latch / Switch Clip</option>
+                  <option value="gate">Gate / Hold While Pressed</option>
+                  <option value="oneshot">One-Shot Trigger</option>
+                </select>
+
+                <label>Assigned Video Source</label>
+                <select id="edit-pad-clip"></select>
+
+                <label>F1 Pad RGB Color</label>
+                <div class="row-inline">
+                  <input id="edit-pad-color" type="color" value="#00f5d4" />
+                  <label class="checkbox-inline">
+                    <input id="edit-pad-reverse" type="checkbox" /> Reverse
+                  </label>
+                  <label class="checkbox-inline">
+                    <input id="edit-pad-quantize" type="checkbox" /> Beat Snap
+                  </label>
+                </div>
+
+                <label>Pad Speed Multiplier</label>
+                <div class="row-inline">
+                  <input id="edit-pad-speed" type="range" min="0.25" max="3.0" step="0.05" value="1.0" />
+                  <span id="edit-pad-speed-val" class="mono-val">1.00×</span>
+                </div>
+              </div>
+
+              <hr class="divider" />
+              <div class="card-title">
+                <span>OUTPUT CANVAS SETUP</span>
+              </div>
+              <div class="form-grid">
+                <label>Output Resolution</label>
+                <select id="edit-canvas-preset"></select>
+
+                <label>Target Frame Rate & Fit</label>
+                <div class="row-inline">
+                  <select id="edit-canvas-fps">
+                    <option value="60">60 FPS</option>
+                    <option value="30">30 FPS</option>
+                  </select>
+                  <select id="edit-canvas-fit">
+                    <option value="cover">Cover (Fill)</option>
+                    <option value="contain">Contain (Letterbox)</option>
+                    <option value="stretch">Stretch</option>
+                  </select>
+                  <label class="checkbox-inline">
+                    <input id="edit-canvas-crt" type="checkbox" checked /> CRT Scanlines
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Column 2: Basic Video Editor & Clip Pool -->
+            <div class="card-panel">
+              <div class="card-title">
+                <span>BASIC VIDEO EDITOR & CLIP POOL</span>
+                <button id="btn-import-videos" class="mini-action-btn">+ Import MP4/WebM</button>
+              </div>
+
+              <div id="edit-clip-list" class="clip-pool-list"></div>
+
+              <div class="card-title" style="margin-top: 8px;">
+                <span>CLIP TRIM & GEOMETRY</span>
+                <span id="edit-clip-duration-badge" class="mono-val">16.0s</span>
+              </div>
+              <div class="form-grid">
+                <label>In Point (Start Trim)</label>
+                <div class="row-inline">
+                  <input id="edit-clip-in" type="range" min="0" max="16" step="0.05" value="0" />
+                  <span id="edit-clip-in-val" class="mono-val">0.00s</span>
+                </div>
+
+                <label>Out Point (End Trim)</label>
+                <div class="row-inline">
+                  <input id="edit-clip-out" type="range" min="0.1" max="16" step="0.05" value="16" />
+                  <span id="edit-clip-out-val" class="mono-val">16.00s</span>
+                </div>
+
+                <label>Loop Mode & Base Speed</label>
+                <div class="row-inline">
+                  <select id="edit-clip-loop">
+                    <option value="loop">Loop Forward</option>
+                    <option value="pingpong">Ping-Pong Bounce</option>
+                    <option value="oneshot">One-Shot Hold</option>
+                  </select>
+                  <input id="edit-clip-speed" type="range" min="0.25" max="3.0" step="0.05" value="1.0" />
+                  <span id="edit-clip-speed-val" class="mono-val">1.00×</span>
+                </div>
+
+                <label>Crop Zoom & Mirror</label>
+                <div class="row-inline">
+                  <input id="edit-clip-zoom" type="range" min="0.5" max="2.5" step="0.05" value="1.0" />
+                  <span id="edit-clip-zoom-val" class="mono-val">1.00×</span>
+                  <label class="checkbox-inline"><input id="edit-clip-fliph" type="checkbox" /> Flip H</label>
+                  <label class="checkbox-inline"><input id="edit-clip-flipv" type="checkbox" /> Flip V</label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Column 3: The Bend Lab (Per-Pad Circuit-Bend Preset & Audio FFT Reactivity) -->
+            <div class="card-panel">
+              <div class="card-title">
+                <span>CIRCUIT-BEND LAB (PAD SIGNATURE)</span>
+                <button id="btn-snapshot-f1-to-pad" class="mini-action-btn accent" title="Copy current 8 F1 Knob/Fader positions into this Pad's Bend Signature [CAPTURE]">
+                  Snapshot F1 → Pad
+                </button>
+              </div>
+              <p class="helper-note">
+                Set the baseline circuit-bend offsets baked into <strong id="bend-lab-pad-title">PAD 1</strong>, plus optional Audio FFT modulation per macro:
+              </p>
+              <div id="edit-bend-signature-rows" class="bend-signature-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================== -->
+        <!-- MODE 2: PERFORM MODE WORKBENCH (Music Deck, Live Jam & Recorder)   -->
+        <!-- =================================================================== -->
+        <section id="mode-panel-perform" class="mode-workbench">
+          <div class="perform-grid">
+            <!-- Music Deck & Full-Track Waveform Overview -->
+            <div class="card-panel perform-deck-panel">
+              <div class="card-title">
+                <span>MASTER MUSIC DECK & BEAT GRID</span>
+                <div class="row-inline">
+                  <button id="btn-perform-load-audio" class="mini-action-btn">♪ Load WAV / MP3 / FLAC</button>
+                  <button id="btn-perform-use-synth" class="mini-action-btn">Built-in 128 BPM Electro Synth</button>
+                </div>
+              </div>
+
+              <div class="waveform-overview-wrap">
+                <canvas id="perform-waveform-canvas" width="900" height="84"></canvas>
+              </div>
+
+              <div class="perform-controls-strip">
+                <div class="perf-stat-box">
+                  <span class="stat-label">ACTIVE TRACK</span>
+                  <strong id="perform-track-name">Built-in 128 BPM Electro Breakbeat</strong>
+                </div>
+                <div class="perf-stat-box">
+                  <span class="stat-label">LIVE PAD QUANTIZE</span>
+                  <div class="row-inline">
+                    <select id="perform-quantize-grid">
+                      <option value="off">Free (No Snap)</option>
+                      <option value="1/32">1/32 Note</option>
+                      <option value="1/16" selected>1/16 Note</option>
+                      <option value="1/8">1/8 Note</option>
+                      <option value="1/4">1/4 Beat</option>
+                      <option value="bar">1 Bar</option>
+                    </select>
+                    <label class="checkbox-inline">
+                      <input id="perform-quantize-toggle" type="checkbox" /> QUANT Active
+                    </label>
+                  </div>
+                </div>
+                <div class="perf-stat-box">
+                  <span class="stat-label">LIVE STUTTER ROLL (HOLD / LATCH)</span>
+                  <div class="stutter-btns">
+                    <button class="stutter-btn active" data-stutter="off">OFF</button>
+                    <button class="stutter-btn" data-stutter="1/4">1/4</button>
+                    <button class="stutter-btn" data-stutter="1/8">1/8</button>
+                    <button class="stutter-btn" data-stutter="1/16">1/16</button>
+                    <button class="stutter-btn" data-stutter="1/32">1/32</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Performance Event Recorder & Recorded Takes List -->
+            <div class="card-panel perform-recorder-panel">
+              <div class="card-title">
+                <span>PERFORMANCE EVENT RECORDER</span>
+                <span id="perform-rec-status" class="badge-tag">READY</span>
+              </div>
+              <p class="helper-note">
+                Press <strong>CAPTURE</strong> on the F1 (or <strong>● REC</strong>) to start the music and record all 16 pad triggers + 8 knob/fader automation trajectories into a deterministic Take.
+              </p>
+              <button id="btn-perform-big-rec" class="big-record-btn">
+                ● START RECORDING TAKE (F1 CAPTURE)
+              </button>
+
+              <div class="card-title" style="margin-top: 10px;">
+                <span>RECORDED PERFORMANCE TAKES</span>
+              </div>
+              <div id="perform-takes-list" class="takes-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- =================================================================== -->
+        <!-- MODE 3: PLAYBACK MODE WORKBENCH (16-Pad Piano Roll & 8 Macro Lanes) -->
+        <!-- =================================================================== -->
+        <section id="mode-panel-playback" class="mode-workbench">
+          <div class="piano-roll-toolbar">
+            <div class="pr-tool-group">
+              <label>TAKE:</label>
+              <select id="playback-take-select"></select>
+              <button id="btn-new-blank-take" class="mini-action-btn" title="Create Clean Blank Take">+ Blank</button>
+            </div>
+
+            <div class="pr-tool-group">
+              <label>TOOL:</label>
+              <button class="pr-tool-btn active" data-tool="select" title="Select, Move, or Drag Note Edges">Select / Trim</button>
+              <button class="pr-tool-btn" data-tool="draw" title="Draw New Pad Triggers (Right-Click to Delete)">Pencil</button>
+              <button class="pr-tool-btn" data-tool="slice" title="Slice Note Block at Cursor">Razor Slice</button>
+              <button class="pr-tool-btn" data-tool="chop" title="Chop Note into Rhythmic Stutter Roll at Grid Snap">Stutter Chop</button>
+              <button class="pr-tool-btn" data-tool="slip" title="Drag Inside Note to Slip Internal Video Start Frame">Slip Offset</button>
+            </div>
+
+            <div class="pr-tool-group">
+              <label>SNAP:</label>
+              <select id="playback-grid-select">
+                <option value="bar">1 Bar</option>
+                <option value="1/2">1/2 Note</option>
+                <option value="1/4">1/4 Beat</option>
+                <option value="1/8">1/8 Note</option>
+                <option value="1/16" selected>1/16 Note</option>
+                <option value="1/32">1/32 Note</option>
+                <option value="off">Free (Off)</option>
+              </select>
+              <button id="btn-quantize-notes" class="mini-action-btn accent" title="Snap Selected (or All) Notes to Beat Grid [F1 QUANT]">
+                Quantize (QUANT)
+              </button>
+              <button id="btn-delete-notes" class="mini-action-btn" title="Delete Selected Notes [Del or Right-Click]">
+                Delete Note
+              </button>
+            </div>
+
+            <div class="pr-tool-group">
+              <label>MACRO LANE:</label>
+              <select id="playback-macro-select"></select>
+              <button id="btn-smooth-macro" class="mini-action-btn" title="Smooth Hand-Recorded Automation Jitter">Smooth</button>
+              <button id="btn-lfo-sine" class="mini-action-btn" title="Generate Tempo-Synced Sine LFO on Active Lane">Sine LFO</button>
+              <button id="btn-lfo-saw" class="mini-action-btn" title="Generate Tempo-Synced Sawtooth Ramp on Active Lane">Saw LFO</button>
+              <button id="btn-clear-macro" class="mini-action-btn" title="Reset Active Macro Automation Lane">Reset Lane</button>
+            </div>
+          </div>
+
+          <div class="piano-roll-canvas-wrap">
+            <canvas id="playback-pianoroll-canvas"></canvas>
+          </div>
+        </section>
+      </div>
+
+      <!-- Right Dock: Interactive Native Instruments Traktor Kontrol F1 -->
+      <aside id="f1-hardware-dock" class="f1-dock"></aside>
+    </main>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "bent",
+  "version": "0.1.0",
+  "description": "Circuit-bent video synthesizer, live Traktor Kontrol F1 VJ instrument, and FL Studio-style Piano Roll visual timeline",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.js"
+  },
+  "author": "Jacob",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}
