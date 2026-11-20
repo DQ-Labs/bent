@@ -16,18 +16,20 @@ export class AudioDeckEngine {
     this.duration = 15.0;
     this.bpm = 128;
     this.trackName = 'Built-in 128 BPM Electro Breakbeat Synth';
+    this.onTrackEnded = null;
 
-    this.fftBytes = new Uint8Array(256);
+    this._playRequestId = 0;
+    this.fftBytes = new Uint8Array(1024);
     this.waveformPeaks = new Float32Array(600);
   }
 
-  async ensureContext() {
+  async ensureContextOnly() {
     if (!this.ctx) {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       this.ctx = new AudioCtx();
       this.analyser = this.ctx.createAnalyser();
-      this.analyser.fftSize = 512;
-      this.analyser.smoothingTimeConstant = 0.72;
+      this.analyser.fftSize = 2048;
+      this.analyser.smoothingTimeConstant = 0.74;
       this.fftBytes = new Uint8Array(this.analyser.frequencyBinCount);
 
       this.gainNode = this.ctx.createGain();
@@ -35,6 +37,10 @@ export class AudioDeckEngine {
       this.gainNode.connect(this.analyser);
       this.analyser.connect(this.ctx.destination);
     }
+  }
+
+  async ensureContext() {
+    await this.ensureContextOnly();
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume();
     }
@@ -45,7 +51,7 @@ export class AudioDeckEngine {
 
   /**
    * Synthesize a punchy 8-bar Electro / Acid Breakbeat AudioBuffer in memory
-   * so Perform & Playback modes work out of the box before loading an external audio file.
+   * using additive voice tails so voices decay smoothly across 1/16th step boundaries.
    */
   async loadBuiltInSynthTrack(bpm = 128, bars = 8) {
     await this.ensureContextOnly();
@@ -77,56 +83,78 @@ export class AudioDeckEngine {
       return (prng / 1073741823.5) - 1.0;
     };
 
+    const kickTailSamples = Math.floor(0.32 * sampleRate);
+    const snareTailSamples = Math.floor(0.24 * sampleRate);
+    const bassTailSamples = Math.floor(Math.min(0.35, stepSec * 1.45) * sampleRate);
+
     for (let step = 0; step < totalSteps; step++) {
       const stepInBar = step % 16;
       const startSample = Math.floor(step * stepSec * sampleRate);
-      const stepSamples = Math.floor(stepSec * sampleRate);
-
       const hasKick = kickSteps.has(stepInBar);
       const hasSnare = snareSteps.has(stepInBar);
       const bassFreq = bassNotes[step % bassNotes.length];
 
-      for (let i = 0; i < stepSamples && startSample + i < totalSamples; i++) {
+      // 1. Punchy 808/909 Sub Kick with smooth exponential pitch sweep & decay tail
+      if (hasKick) {
+        let phase = 0;
+        const len = Math.min(kickTailSamples, totalSamples - startSample);
+        for (let i = 0; i < len; i++) {
+          const t = i / sampleRate;
+          const env = Math.exp(-t * 14.0) * Math.min(1, i / 24);
+          const freq = 46 + 135 * Math.exp(-t * 42.0);
+          phase += (2 * Math.PI * freq) / sampleRate;
+          const sig = Math.sin(phase) * env * 0.68;
+          left[startSample + i] += sig;
+          right[startSample + i] += sig;
+        }
+      }
+
+      // 2. Crisp Electro Snare with full decay tail
+      if (hasSnare) {
+        const len = Math.min(snareTailSamples, totalSamples - startSample);
+        for (let i = 0; i < len; i++) {
+          const t = i / sampleRate;
+          const attack = Math.min(1, i / 16);
+          const snareEnv = Math.exp(-t * 22.0) * attack;
+          const body = Math.sin(2 * Math.PI * 185 * t) * Math.exp(-t * 34.0) * 0.34 * attack;
+          const snap = nextNoise() * snareEnv * 0.4;
+          left[startSample + i] += body + snap;
+          right[startSample + i] += body + snap * 0.95;
+        }
+      }
+
+      // 3. 16th-Note Closed/Open Hi-Hat
+      const isOpenHat = stepInBar % 4 === 2;
+      const hatDecay = isOpenHat ? 18.0 : 52.0;
+      const hatLen = Math.min(Math.floor((isOpenHat ? 0.22 : 0.08) * sampleRate), totalSamples - startSample);
+      for (let i = 0; i < hatLen; i++) {
         const t = i / sampleRate;
-        let sampleL = 0;
-        let sampleR = 0;
+        const hatEnv = Math.exp(-t * hatDecay) * Math.min(1, i / 12);
+        const hatSig = nextNoise() * hatEnv * 0.13;
+        left[startSample + i] += hatSig * 0.85;
+        right[startSample + i] += hatSig * 1.15;
+      }
 
-        // 1. Punchy 808/909 Sub Kick
-        if (hasKick) {
-          const kickEnv = Math.exp(-t * 15.0);
-          const pitchEnv = 46 + 135 * Math.exp(-t * 42.0);
-          const kickSig = Math.sin(2 * Math.PI * pitchEnv * t) * kickEnv * 0.72;
-          sampleL += kickSig;
-          sampleR += kickSig;
-        }
-
-        // 2. Crisp Electro Snare
-        if (hasSnare) {
-          const snareEnv = Math.exp(-t * 24.0);
-          const body = Math.sin(2 * Math.PI * 185 * t) * Math.exp(-t * 35.0) * 0.35;
-          const snap = nextNoise() * snareEnv * 0.42;
-          sampleL += body + snap;
-          sampleR += body + snap * 0.95;
-        }
-
-        // 3. 16th-Note Closed/Open Hi-Hat
-        const hatDecay = stepInBar % 4 === 2 ? 18.0 : 52.0;
-        const hatEnv = Math.exp(-t * hatDecay);
-        const hatSig = nextNoise() * hatEnv * 0.14;
-        sampleL += hatSig * 0.85;
-        sampleR += hatSig * 1.15;
-
-        // 4. Acid Saw/Square Bassline
-        const bassEnv = Math.exp(-t * 9.5);
+      // 4. Acid Saw/Square Bassline with short fade-out at tail end
+      const bassLen = Math.min(bassTailSamples, totalSamples - startSample);
+      const fadeSamples = Math.min(96, Math.floor(bassLen * 0.2));
+      for (let i = 0; i < bassLen; i++) {
+        const t = i / sampleRate;
+        const attack = Math.min(1, i / 24);
+        const release = i > bassLen - fadeSamples ? (bassLen - i) / fadeSamples : 1;
+        const bassEnv = Math.exp(-t * 9.5) * attack * release;
         const saw = 2 * ((t * bassFreq) - Math.floor(0.5 + t * bassFreq));
         const sub = Math.sin(2 * Math.PI * bassFreq * t);
-        const acid = Math.tanh((saw * 0.65 + sub * 0.6) * (1.8 + bassEnv * 2.5)) * bassEnv * 0.34;
-        sampleL += acid;
-        sampleR += acid;
-
-        left[startSample + i] = Math.max(-0.98, Math.min(0.98, sampleL));
-        right[startSample + i] = Math.max(-0.98, Math.min(0.98, sampleR));
+        const acid = Math.tanh((saw * 0.65 + sub * 0.6) * (1.8 + bassEnv * 2.5)) * bassEnv * 0.32;
+        left[startSample + i] += acid;
+        right[startSample + i] += acid;
       }
+    }
+
+    // Soft-limit master sum cleanly
+    for (let i = 0; i < totalSamples; i++) {
+      left[i] = Math.tanh(left[i]);
+      right[i] = Math.tanh(right[i]);
     }
 
     this.audioBuffer = buffer;
@@ -142,22 +170,6 @@ export class AudioDeckEngine {
     };
   }
 
-  async ensureContextOnly() {
-    if (!this.ctx) {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      this.ctx = new AudioCtx();
-      this.analyser = this.ctx.createAnalyser();
-      this.analyser.fftSize = 512;
-      this.analyser.smoothingTimeConstant = 0.72;
-      this.fftBytes = new Uint8Array(this.analyser.frequencyBinCount);
-
-      this.gainNode = this.ctx.createGain();
-      this.gainNode.gain.value = 0.85;
-      this.gainNode.connect(this.analyser);
-      this.analyser.connect(this.ctx.destination);
-    }
-  }
-
   /**
    * Decode and load an ArrayBuffer from a local audio file (.wav, .mp3, .flac, .ogg).
    */
@@ -166,7 +178,7 @@ export class AudioDeckEngine {
     const wasPlaying = this.isPlaying;
     if (wasPlaying) this.pause();
 
-    const decoded = await this.ctx.decodeAudioData(arrayBuffer.slice(0));
+    const decoded = await this.ctx.decodeAudioData(arrayBuffer);
     this.audioBuffer = decoded;
     this.duration = Number(decoded.duration.toFixed(4));
     this.trackName = fileName;
@@ -208,57 +220,70 @@ export class AudioDeckEngine {
     if (!this.audioBuffer) return 128;
     const ch0 = this.audioBuffer.getChannelData(0);
     const sr = this.audioBuffer.sampleRate;
-    // Compute energy envelope in 20ms windows across up to first 30 seconds
-    const winSize = Math.floor(sr * 0.02);
+    // Use 5ms windows (~200 Hz) so every integer BPM 86..168 maps to a distinct lag
+    const winSize = Math.max(64, Math.floor(sr * 0.005));
     const maxSamples = Math.min(ch0.length, sr * 30);
     const numWins = Math.floor(maxSamples / winSize);
-    if (numWins < 40) return 128;
+    if (numWins < 160) return 128;
 
     const env = new Float32Array(numWins);
     for (let w = 0; w < numWins; w++) {
       let sum = 0;
       const base = w * winSize;
-      for (let i = 0; i < winSize; i += 4) {
+      for (let i = 0; i < winSize; i += 2) {
         const s = ch0[base + i];
         sum += s * s;
       }
-      env[w] = Math.sqrt(sum / (winSize / 4));
+      env[w] = Math.sqrt(sum / (winSize / 2));
     }
 
-    // Autocorrelate onset differences across 85..170 BPM
+    // Half-wave rectified onset flux
     const diffs = new Float32Array(numWins);
     for (let w = 1; w < numWins; w++) {
       diffs[w] = Math.max(0, env[w] - env[w - 1]);
     }
 
-    const winRate = sr / winSize; // ~50 Hz
+    const winRate = sr / winSize;
     let bestBpm = 128;
     let bestScore = -1;
     for (let bpm = 86; bpm <= 168; bpm += 1) {
       const lag = Math.round((60 / bpm) * winRate);
+      if (lag <= 0 || lag >= numWins) continue;
       let score = 0;
+      const count = numWins - lag;
       for (let i = lag; i < numWins; i++) {
         score += diffs[i] * diffs[i - lag];
       }
-      if (score > bestScore) {
-        bestScore = score;
+      // Normalize by overlap count so shorter lags (higher BPMs) are not favored
+      const normalized = score / count;
+      if (normalized > bestScore) {
+        bestScore = normalized;
         bestBpm = bpm;
       }
     }
     return bestBpm;
   }
 
-  async play() {
-    await this.ensureContext();
-    if (this.isPlaying) return;
+  setLoop(enabled) {
+    this.loop = Boolean(enabled);
+    if (this.sourceNode) {
+      this.sourceNode.loop = this.loop;
+    }
+  }
 
+  _startSourceSync() {
     this._stopSourceNode();
+    if (!this.ctx || !this.audioBuffer) return;
     const src = this.ctx.createBufferSource();
     src.buffer = this.audioBuffer;
     src.loop = this.loop;
     src.connect(this.gainNode);
 
-    const offset = ((this.startOffset % this.duration) + this.duration) % this.duration;
+    const safeDur = Math.max(0.01, this.duration);
+    const offset = this.loop
+      ? ((this.startOffset % safeDur) + safeDur) % safeDur
+      : Math.max(0, Math.min(safeDur - 0.005, this.startOffset));
+
     src.start(0, offset);
     this.sourceNode = src;
     this.playStartedAtCtxTime = this.ctx.currentTime - offset;
@@ -266,13 +291,25 @@ export class AudioDeckEngine {
 
     src.onended = () => {
       if (this.sourceNode === src && !this.loop) {
+        this.sourceNode = null;
         this.isPlaying = false;
-        this.startOffset = 0;
+        this.startOffset = this.duration;
+        this.onTrackEnded?.();
       }
     };
   }
 
+  async play() {
+    const reqId = ++this._playRequestId;
+    await this.ensureContext();
+    // Abort if another play/pause/stop/seek superseded this request while awaiting
+    if (reqId !== this._playRequestId) return;
+    if (this.isPlaying) return;
+    this._startSourceSync();
+  }
+
   pause() {
+    this._playRequestId++;
     if (!this.isPlaying) return;
     this.startOffset = this.getCurrentTime();
     this._stopSourceNode();
@@ -280,6 +317,7 @@ export class AudioDeckEngine {
   }
 
   stop() {
+    this._playRequestId++;
     this._stopSourceNode();
     this.isPlaying = false;
     this.startOffset = 0;
@@ -289,9 +327,15 @@ export class AudioDeckEngine {
     const clamped = Math.max(0, Math.min(this.duration, Number(timeSec) || 0));
     this.startOffset = clamped;
     if (this.isPlaying) {
-      this._stopSourceNode();
-      this.isPlaying = false;
-      this.play();
+      this._playRequestId++;
+      if (this.ctx && this.ctx.state === 'running' && this.audioBuffer) {
+        // Synchronous restart eliminates async race conditions during rapid timeline scrubbing
+        this._startSourceSync();
+      } else {
+        this._stopSourceNode();
+        this.isPlaying = false;
+        this.play();
+      }
     }
   }
 
@@ -313,28 +357,32 @@ export class AudioDeckEngine {
   }
 
   /**
-   * Return normalized 4-band FFT spectrum energies: { sub, kick, mid, high }.
+   * Return normalized 4-band FFT spectrum energies derived from sampleRate:
+   * sub (20–90 Hz), kick (60–200 Hz), mid (250–2000 Hz), high (2500–12000 Hz).
    */
   getFFTData() {
-    if (!this.analyser || !this.isPlaying) {
+    if (!this.analyser || !this.ctx || !this.isPlaying) {
       return { sub: 0, kick: 0, mid: 0, high: 0 };
     }
     this.analyser.getByteFrequencyData(this.fftBytes);
 
-    const avgRange = (startBin, endBin) => {
+    const binHz = this.ctx.sampleRate / this.analyser.fftSize;
+    const maxBin = this.fftBytes.length - 1;
+    const avgHzRange = (lowHz, highHz) => {
+      const startBin = Math.max(1, Math.floor(lowHz / binHz));
+      const endBin = Math.min(maxBin, Math.max(startBin + 1, Math.ceil(highHz / binHz)));
       let sum = 0;
-      const count = Math.max(1, endBin - startBin);
-      for (let i = startBin; i < endBin && i < this.fftBytes.length; i++) {
+      for (let i = startBin; i < endBin; i++) {
         sum += this.fftBytes[i];
       }
-      return Math.min(1.0, (sum / count) / 235);
+      return Math.min(1.0, (sum / (endBin - startBin)) / 235);
     };
 
     return {
-      sub: avgRange(1, 5),
-      kick: avgRange(4, 14),
-      mid: avgRange(14, 52),
-      high: avgRange(52, 140)
+      sub: avgHzRange(20, 90),
+      kick: avgHzRange(60, 200),
+      mid: avgHzRange(250, 2000),
+      high: avgHzRange(2500, 12000)
     };
   }
 

@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: bent-media:; media-src 'self' blob: bent-media:; connect-src 'self' bent-media:;" />
   <title>BENT // Video Bending & Traktor Kontrol F1 Workstation</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -75,6 +76,7 @@
               <span id="badge-active-pad" class="hud-pill accent">PAD 1: PM5544 Clean</span>
               <span id="badge-active-fx" class="hud-pill warn hidden">FX PUNCH ACTIVE</span>
               <span id="badge-rec-state" class="hud-pill danger hidden">● REC TAKE</span>
+              <span id="badge-toast" class="hud-pill toast hidden"></span>
             </div>
           </div>
 

@@ -38,22 +38,77 @@ export class PianoRollTimelineUI {
     this.automationHeaderHeight = 24;
 
     this.dragState = null;
+    this._undoStack = [];
+    this._redoStack = [];
+    this._maxHistory = 50;
 
     this._bindCanvasEvents();
     this._setupResizeObserver();
   }
 
   setContext(project, take, waveformPeaks = null) {
+    const takeChanged = this.take?.id !== take?.id;
     this.project = project;
     this.take = take;
     if (waveformPeaks) {
       this.waveformPeaks = waveformPeaks;
     }
+    if (takeChanged) {
+      this.selectedNoteIds.clear();
+      this._undoStack = [];
+      this._redoStack = [];
+    }
     this.render();
   }
 
+  _pushUndoSnapshot() {
+    if (!this.take) return;
+    this._undoStack.push({
+      notes: structuredClone(this.take.notes || []),
+      automation: structuredClone(this.take.automation || [])
+    });
+    if (this._undoStack.length > this._maxHistory) {
+      this._undoStack.shift();
+    }
+    this._redoStack = [];
+  }
+
+  undo() {
+    if (!this.take || this._undoStack.length === 0) return false;
+    this._redoStack.push({
+      notes: structuredClone(this.take.notes || []),
+      automation: structuredClone(this.take.automation || [])
+    });
+    const prev = this._undoStack.pop();
+    this.take.notes = prev.notes;
+    this.take.automation = prev.automation;
+    this.selectedNoteIds.clear();
+    this.callbacks.onTakeModified?.(this.take);
+    this.render();
+    return true;
+  }
+
+  redo() {
+    if (!this.take || this._redoStack.length === 0) return false;
+    this._undoStack.push({
+      notes: structuredClone(this.take.notes || []),
+      automation: structuredClone(this.take.automation || [])
+    });
+    const next = this._redoStack.pop();
+    this.take.notes = next.notes;
+    this.take.automation = next.automation;
+    this.selectedNoteIds.clear();
+    this.callbacks.onTakeModified?.(this.take);
+    this.render();
+    return true;
+  }
+
   setPlayhead(timeSec) {
-    this.playheadTime = Math.max(0, Number(timeSec) || 0);
+    const nextTime = Math.max(0, Number(timeSec) || 0);
+    if (Math.abs(this.playheadTime - nextTime) < 1e-4) {
+      return;
+    }
+    this.playheadTime = nextTime;
     // Auto-scroll if playhead moves outside visible range during playback
     const viewWidthPx = Math.max(200, (this.canvas.clientWidth || 900) - this.sidebarWidth);
     const viewDuration = viewWidthPx / this.zoomPxPerSec;
@@ -82,6 +137,7 @@ export class PianoRollTimelineUI {
 
   quantizeSelectedOrAll() {
     if (!this.take || !this.project) return;
+    this._pushUndoSnapshot();
     const bpm = this.project.audio.bpm || 128;
     const div = this.gridDivision === 'off' ? '1/16' : this.gridDivision;
     this.take.notes = quantizeTakeNotes(
@@ -97,6 +153,7 @@ export class PianoRollTimelineUI {
 
   smoothActiveMacroLane() {
     if (!this.take) return;
+    this._pushUndoSnapshot();
     const lane = this.take.automation[this.activeMacroIndex] || [];
     this.take.automation[this.activeMacroIndex] = smoothAutomationLane(lane, 2);
     this.callbacks.onTakeModified?.(this.take);
@@ -105,6 +162,7 @@ export class PianoRollTimelineUI {
 
   applyLfoToActiveMacro(shape = 'sine') {
     if (!this.take || !this.project) return;
+    this._pushUndoSnapshot();
     const bpm = this.project.audio.bpm || 128;
     const div = this.gridDivision === 'off' ? '1/4' : this.gridDivision;
     const dur = this.take.duration || this.project.audio.duration || 15.0;
@@ -125,6 +183,7 @@ export class PianoRollTimelineUI {
 
   clearActiveMacroLane() {
     if (!this.take) return;
+    this._pushUndoSnapshot();
     const defVal = GLOBAL_MACROS[this.activeMacroIndex].defaultValue;
     const dur = this.take.duration || 15.0;
     this.take.automation[this.activeMacroIndex] = [
@@ -137,6 +196,7 @@ export class PianoRollTimelineUI {
 
   deleteSelectedNotes() {
     if (!this.take || this.selectedNoteIds.size === 0) return;
+    this._pushUndoSnapshot();
     this.take.notes = this.take.notes.filter((n) => !this.selectedNoteIds.has(n.id));
     this.selectedNoteIds.clear();
     this.callbacks.onTakeModified?.(this.take);
@@ -252,6 +312,7 @@ export class PianoRollTimelineUI {
 
   _drawBeatGrid(ctx, w, h, gridTop, gridHeight, autoTop, autoHeight) {
     const bpm = this.project?.audio?.bpm || 128;
+    const beatOffset = this.project?.audio?.beatOffset || 0;
     const beatSec = 60 / bpm;
     const barSec = beatSec * 4;
     const snapSec = gridDivisionToSeconds(bpm, this.gridDivision === 'off' ? '1/16' : this.gridDivision);
@@ -259,12 +320,13 @@ export class PianoRollTimelineUI {
 
     // Fine subdivision grid lines
     if (snapSec > 0 && snapSec * this.zoomPxPerSec >= 7) {
-      const startIdx = Math.floor(this.scrollTimeOffset / snapSec);
-      const endIdx = Math.ceil(maxTime / snapSec);
+      const startIdx = Math.floor((this.scrollTimeOffset - beatOffset) / snapSec);
+      const endIdx = Math.ceil((maxTime - beatOffset) / snapSec);
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.035)';
       ctx.lineWidth = 1;
       for (let i = startIdx; i <= endIdx; i++) {
-        const t = i * snapSec;
+        const t = i * snapSec + beatOffset;
+        if (t < 0) continue;
         const x = this.timeToX(t);
         if (x < this.sidebarWidth || x > w) continue;
         ctx.beginPath();
@@ -277,13 +339,14 @@ export class PianoRollTimelineUI {
     }
 
     // Beat & Bar lines
-    const startBeat = Math.floor(this.scrollTimeOffset / beatSec);
-    const endBeat = Math.ceil(maxTime / beatSec);
+    const startBeat = Math.floor((this.scrollTimeOffset - beatOffset) / beatSec);
+    const endBeat = Math.ceil((maxTime - beatOffset) / beatSec);
     for (let b = startBeat; b <= endBeat; b++) {
-      const t = b * beatSec;
+      const t = b * beatSec + beatOffset;
+      if (t < 0) continue;
       const x = this.timeToX(t);
       if (x < this.sidebarWidth || x > w) continue;
-      const isBar = b % 4 === 0;
+      const isBar = ((b % 4) + 4) % 4 === 0;
       ctx.strokeStyle = isBar ? 'rgba(255, 255, 255, 0.22)' : 'rgba(255, 255, 255, 0.09)';
       ctx.lineWidth = isBar ? 1.5 : 1;
       ctx.beginPath();
@@ -316,14 +379,16 @@ export class PianoRollTimelineUI {
 
     // Draw Bar & Beat Numbers
     const bpm = this.project?.audio?.bpm || 128;
+    const beatOffset = this.project?.audio?.beatOffset || 0;
     const beatSec = 60 / bpm;
     const maxTime = this.xToTime(w);
-    const startBeat = Math.max(0, Math.floor(this.scrollTimeOffset / beatSec));
-    const endBeat = Math.ceil(maxTime / beatSec);
+    const startBeat = Math.max(0, Math.floor((this.scrollTimeOffset - beatOffset) / beatSec));
+    const endBeat = Math.ceil((maxTime - beatOffset) / beatSec);
 
     ctx.font = 'bold 11px Consolas, monospace';
     for (let b = startBeat; b <= endBeat; b++) {
-      const t = b * beatSec;
+      const t = b * beatSec + beatOffset;
+      if (t < 0) continue;
       const x = this.timeToX(t);
       if (x < this.sidebarWidth || x > w) continue;
       const barNum = Math.floor(b / 4) + 1;
@@ -617,6 +682,7 @@ export class PianoRollTimelineUI {
       // Right-click deletes note (FL Studio convention)
       if (e.button === 2) {
         if (hitNote) {
+          this._pushUndoSnapshot();
           this.take.notes = this.take.notes.filter((n) => n.id !== hitNote.id);
           this.selectedNoteIds.delete(hitNote.id);
           this.callbacks.onTakeModified?.(this.take);
@@ -625,18 +691,25 @@ export class PianoRollTimelineUI {
         return;
       }
 
+      const beatOffset = this.project.audio.beatOffset || 0;
+
       if (this.tool === 'slice' && hitNote) {
+        this._pushUndoSnapshot();
         const bpm = this.project.audio.bpm || 128;
         const sliceT = this.gridDivision === 'off'
           ? clickTime
-          : snapTimeToGrid(clickTime, bpm, this.gridDivision);
-        this.take.notes = sliceTakeNote(this.take.notes, hitNote.id, sliceT);
+          : snapTimeToGrid(clickTime, bpm, this.gridDivision, beatOffset);
+        const pad = this.project.pads[hitNote.padIndex];
+        const clip = this.project.clips.find((c) => c.id === pad?.clipId);
+        const effectiveSpeed = (Number(clip?.speed) || 1.0) * (Number(pad?.speedMultiplier) || 1.0);
+        this.take.notes = sliceTakeNote(this.take.notes, hitNote.id, sliceT, effectiveSpeed);
         this.callbacks.onTakeModified?.(this.take);
         this.render();
         return;
       }
 
       if (this.tool === 'chop' && hitNote) {
+        this._pushUndoSnapshot();
         const bpm = this.project.audio.bpm || 128;
         const div = this.gridDivision === 'off' ? '1/16' : this.gridDivision;
         this.take.notes = splitNoteIntoStutterRoll(this.take.notes, hitNote.id, bpm, div);
@@ -646,43 +719,65 @@ export class PianoRollTimelineUI {
       }
 
       if (this.tool === 'slip' && hitNote) {
+        this._pushUndoSnapshot();
         this.selectedNoteIds.clear();
         this.selectedNoteIds.add(hitNote.id);
         this.dragState = {
           kind: 'slip-note',
           note: hitNote,
           startX: x,
-          origSlip: hitNote.slipOffset || 0
+          origSlip: hitNote.slipOffset || 0,
+          dirty: false
         };
         this.render();
         return;
       }
 
       if (hitNote) {
-        if (!e.shiftKey) {
+        if (e.shiftKey) {
+          if (this.selectedNoteIds.has(hitNote.id) && this.selectedNoteIds.size > 1) {
+            this.selectedNoteIds.delete(hitNote.id);
+            this.render();
+            return;
+          }
+          this.selectedNoteIds.add(hitNote.id);
+        } else if (!this.selectedNoteIds.has(hitNote.id)) {
           this.selectedNoteIds.clear();
+          this.selectedNoteIds.add(hitNote.id);
         }
-        this.selectedNoteIds.add(hitNote.id);
 
         const noteRightPx = this.timeToX(hitNote.startTime + hitNote.duration);
         const noteLeftPx = this.timeToX(hitNote.startTime);
 
+        this._pushUndoSnapshot();
         if (Math.abs(x - noteRightPx) <= 8) {
           this.dragState = {
             kind: 'resize-right',
-            note: hitNote
+            note: hitNote,
+            dirty: false
           };
         } else if (Math.abs(x - noteLeftPx) <= 7) {
           this.dragState = {
             kind: 'resize-left',
             note: hitNote,
-            origEnd: hitNote.startTime + hitNote.duration
+            origEnd: hitNote.startTime + hitNote.duration,
+            dirty: false
           };
         } else {
+          // Move all selected notes together preserving relative offsets
+          const selectedNotes = this.take.notes.filter((n) => this.selectedNoteIds.has(n.id));
           this.dragState = {
             kind: 'move-note',
             note: hitNote,
-            timeOffset: clickTime - hitNote.startTime
+            origStart: hitNote.startTime,
+            origPad: hitNote.padIndex,
+            timeOffset: clickTime - hitNote.startTime,
+            items: selectedNotes.map((n) => ({
+              note: n,
+              origStart: n.startTime,
+              origPad: n.padIndex
+            })),
+            dirty: false
           };
         }
         this.render();
@@ -690,13 +785,23 @@ export class PianoRollTimelineUI {
       }
 
       // Clicking empty space in Piano Roll:
-      // In 'draw' mode (or double/direct click), create a new note block!
+      // Only create a new note in 'draw' mode (or double-click in 'select' mode).
+      const shouldDrawNote = this.tool === 'draw' || (this.tool === 'select' && e.detail >= 2);
+      if (!shouldDrawNote) {
+        if (this.selectedNoteIds.size > 0) {
+          this.selectedNoteIds.clear();
+          this.render();
+        }
+        return;
+      }
+
+      this._pushUndoSnapshot();
       const bpm = this.project.audio.bpm || 128;
       const div = this.gridDivision === 'off' ? '1/8' : this.gridDivision;
       const stepSec = Math.max(0.1, gridDivisionToSeconds(bpm, div));
       const startT = this.gridDivision === 'off'
         ? clickTime
-        : Math.floor(clickTime / stepSec) * stepSec;
+        : Math.floor((clickTime - beatOffset) / stepSec) * stepSec + beatOffset;
 
       const newNote = {
         id: `n-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -711,7 +816,8 @@ export class PianoRollTimelineUI {
       this.selectedNoteIds.add(newNote.id);
       this.dragState = {
         kind: 'resize-right',
-        note: newNote
+        note: newNote,
+        dirty: true
       };
       this.callbacks.onTakeModified?.(this.take);
       this.render();
@@ -720,12 +826,14 @@ export class PianoRollTimelineUI {
 
     // 4. Check 8-Lane Macro Automation Section click/drag -> Draw/Move Breakpoints
     if (y >= autoTop && y <= autoTop + autoHeight) {
+      this._pushUndoSnapshot();
       this.dragState = {
         kind: 'draw-automation',
         autoTop,
-        autoHeight
+        autoHeight,
+        dirty: true
       };
-      this._applyAutomationPointAtMouse(x, y, autoTop, autoHeight, e.button === 2);
+      this._applyAutomationPointAtMouse(x, y, autoTop, autoHeight, e.button === 2, false);
     }
   }
 
@@ -735,6 +843,7 @@ export class PianoRollTimelineUI {
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     const bpm = this.project.audio.bpm || 128;
+    const beatOffset = this.project.audio.beatOffset || 0;
     const snapDiv = e.altKey ? 'off' : this.gridDivision;
 
     if (this.dragState.kind === 'scrub') {
@@ -744,18 +853,22 @@ export class PianoRollTimelineUI {
     }
 
     if (this.dragState.kind === 'move-note') {
-      const note = this.dragState.note;
+      const anchor = this.dragState.note;
       const rawStart = Math.max(0, this.xToTime(x) - this.dragState.timeOffset);
-      note.startTime = snapDiv === 'off'
+      const nextAnchorStart = snapDiv === 'off'
         ? Number(rawStart.toFixed(4))
-        : snapTimeToGrid(rawStart, bpm, snapDiv);
+        : snapTimeToGrid(rawStart, bpm, snapDiv, beatOffset);
+      const deltaTime = nextAnchorStart - this.dragState.origStart;
 
       const gridTop = this.rulerHeight;
-      const row = Math.floor((y - gridTop) / this.padRowHeight);
-      if (row >= 0 && row < 16) {
-        note.padIndex = row;
+      const row = Math.max(0, Math.min(15, Math.floor((y - gridTop) / this.padRowHeight)));
+      const deltaRow = row - this.dragState.origPad;
+
+      for (const item of this.dragState.items) {
+        item.note.startTime = Number(Math.max(0, item.origStart + deltaTime).toFixed(4));
+        item.note.padIndex = Math.max(0, Math.min(15, item.origPad + deltaRow));
       }
-      this.callbacks.onTakeModified?.(this.take);
+      this.dragState.dirty = true;
       this.render();
       return;
     }
@@ -765,9 +878,9 @@ export class PianoRollTimelineUI {
       const rawEnd = Math.max(note.startTime + 0.04, this.xToTime(x));
       const snappedEnd = snapDiv === 'off'
         ? rawEnd
-        : Math.max(note.startTime + 0.04, snapTimeToGrid(rawEnd, bpm, snapDiv));
+        : Math.max(note.startTime + 0.04, snapTimeToGrid(rawEnd, bpm, snapDiv, beatOffset));
       note.duration = Number((snappedEnd - note.startTime).toFixed(4));
-      this.callbacks.onTakeModified?.(this.take);
+      this.dragState.dirty = true;
       this.render();
       return;
     }
@@ -778,10 +891,10 @@ export class PianoRollTimelineUI {
       const rawStart = Math.max(0, Math.min(origEnd - 0.04, this.xToTime(x)));
       const snappedStart = snapDiv === 'off'
         ? rawStart
-        : Math.min(origEnd - 0.04, snapTimeToGrid(rawStart, bpm, snapDiv));
+        : Math.min(origEnd - 0.04, snapTimeToGrid(rawStart, bpm, snapDiv, beatOffset));
       note.startTime = Number(snappedStart.toFixed(4));
       note.duration = Number((origEnd - note.startTime).toFixed(4));
-      this.callbacks.onTakeModified?.(this.take);
+      this.dragState.dirty = true;
       this.render();
       return;
     }
@@ -790,23 +903,28 @@ export class PianoRollTimelineUI {
       const note = this.dragState.note;
       const dt = (x - this.dragState.startX) / this.zoomPxPerSec;
       note.slipOffset = Number(Math.max(0, this.dragState.origSlip + dt).toFixed(4));
-      this.callbacks.onTakeModified?.(this.take);
+      this.dragState.dirty = true;
       this.render();
       return;
     }
 
     if (this.dragState.kind === 'draw-automation') {
+      this.dragState.dirty = true;
       this._applyAutomationPointAtMouse(
         x,
         y,
         this.dragState.autoTop,
         this.dragState.autoHeight,
+        false,
         false
       );
     }
   }
 
   _onMouseUp() {
+    if (this.dragState?.dirty && this.take) {
+      this.callbacks.onTakeModified?.(this.take);
+    }
     this.dragState = null;
   }
 
@@ -821,9 +939,12 @@ export class PianoRollTimelineUI {
     return null;
   }
 
-  _applyAutomationPointAtMouse(x, y, autoTop, autoHeight, isDelete = false) {
+  _applyAutomationPointAtMouse(x, y, autoTop, autoHeight, isDelete = false, notify = true) {
     if (!this.take) return;
-    const lane = this.take.automation[this.activeMacroIndex] || [];
+    if (!Array.isArray(this.take.automation[this.activeMacroIndex])) {
+      this.take.automation[this.activeMacroIndex] = [];
+    }
+    const lane = this.take.automation[this.activeMacroIndex];
     const t = Number(this.xToTime(x).toFixed(4));
     const normVal = Number(
       Math.max(0, Math.min(1, 1 - (y - (autoTop + 4)) / Math.max(10, autoHeight - 8))).toFixed(4)
@@ -842,7 +963,9 @@ export class PianoRollTimelineUI {
       }
       lane.sort((a, b) => a.time - b.time);
     }
-    this.callbacks.onTakeModified?.(this.take);
+    if (notify) {
+      this.callbacks.onTakeModified?.(this.take);
+    }
     this.render();
   }
 }

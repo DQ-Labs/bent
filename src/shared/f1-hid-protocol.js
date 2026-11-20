@@ -27,19 +27,28 @@ const SEVEN_SEG_FONT = {
   'D': [0, 1, 1, 1, 1, 0, 1],
   'E': [1, 0, 0, 1, 1, 1, 1],
   'F': [1, 0, 0, 0, 1, 1, 1],
+  'G': [1, 0, 1, 1, 1, 1, 0],
   'H': [0, 1, 1, 0, 1, 1, 1],
+  'I': [0, 1, 1, 0, 0, 0, 0],
   'L': [0, 0, 0, 1, 1, 1, 0],
+  'N': [0, 0, 1, 0, 1, 0, 1],
+  'O': [0, 0, 1, 1, 1, 0, 1],
   'P': [1, 1, 0, 0, 1, 1, 1],
   'R': [0, 0, 0, 0, 1, 0, 1],
+  'S': [1, 0, 1, 1, 0, 1, 1],
+  'T': [0, 0, 0, 1, 1, 1, 1],
   'U': [0, 1, 1, 1, 1, 1, 0],
   '-': [0, 0, 0, 0, 0, 0, 1]
 };
 
 /**
- * Convert a hex color string (e.g. "#00f5d4") to 7-bit F1 LED brightness (0x00..0x7F).
+ * Convert a hex color string (e.g. "#00f5d4" or "#0fd") to 7-bit F1 LED brightness (0x00..0x7F).
  */
 export function hexToF1Rgb(hex, scale = 1.0) {
-  const clean = String(hex || '#000000').replace('#', '');
+  let clean = String(hex || '#000000').replace('#', '').trim();
+  if (clean.length === 3) {
+    clean = clean[0] + clean[0] + clean[1] + clean[1] + clean[2] + clean[2];
+  }
   const num = parseInt(clean.length === 6 ? clean : '000000', 16) || 0;
   const r8 = (num >> 16) & 0xff;
   const g8 = (num >> 8) & 0xff;
@@ -216,17 +225,25 @@ export function buildF1HidOutputPayload(state = {}) {
   payload[23] = fnLeds.sync ? 0x7f : 0x10;
 
   // 3. 16 RGB Pads (indices 24..71, 3 bytes per pad)
+  // Native Instruments Traktor Kontrol F1 Report 0x80 orders pad LED channels as B, R, G.
   const padColors = state.padColors || [];
   const activePads = state.activePads || [];
+  const colorOrder = state.padColorOrder || 'brg';
   for (let i = 0; i < 16; i++) {
     const hex = padColors[i] || '#00f5d4';
     const isActive = Boolean(activePads[i]);
     const scale = isActive ? 1.0 : 0.22;
     const { r, g, b } = hexToF1Rgb(hex, scale);
     const base = 24 + i * 3;
-    payload[base] = r;
-    payload[base + 1] = g;
-    payload[base + 2] = b;
+    if (colorOrder === 'rgb') {
+      payload[base] = r;
+      payload[base + 1] = g;
+      payload[base + 2] = b;
+    } else {
+      payload[base] = b;
+      payload[base + 1] = r;
+      payload[base + 2] = g;
+    }
   }
 
   // 4. 4 Bottom Stop Buttons (indices 72..79, ordered Stop 4 down to Stop 1)

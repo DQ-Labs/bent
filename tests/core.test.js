@@ -10,6 +10,7 @@ import {
 import {
   F1_INPUT_REPORT_ID,
   F1_OUTPUT_PAYLOAD_LENGTH,
+  hexToF1Rgb,
   parseF1HidInputReport,
   buildF1HidOutputPayload,
   parseF1MidiMessage,
@@ -23,7 +24,8 @@ import {
   sliceTakeNote,
   splitNoteIntoStutterRoll,
   smoothAutomationLane,
-  generateAutomationLfo
+  generateAutomationLfo,
+  mergeAutomationOverdub
 } from '../src/shared/timeline-engine.js';
 
 test('Project Schema: creates 16 pads, 8 global circuit-bend macros, and demo take', () => {
@@ -141,4 +143,110 @@ test('Timeline Engine: records live performance take, evaluates deterministicall
   assert.ok(lfoLane.length > 5);
   const smoothed = smoothAutomationLane(lfoLane, 2);
   assert.equal(smoothed.length, lfoLane.length);
+});
+
+test('Project Schema: normalizes malformed takes, missing automation lanes, and preserves midiMap', () => {
+  const normalized = validateAndNormalizeProject({
+    takes: [
+      {
+        id: 'corrupt-take',
+        name: 'Partial Take',
+        notes: [
+          { padIndex: 99, startTime: -2, duration: 0 },
+          null
+        ],
+        automation: [[{ time: 1.5, value: 2.5 }, { time: 0.2, value: -1 }]]
+      }
+    ],
+    midiMap: { padNotes: Array.from({ length: 16 }, (_, i) => 60 + i) }
+  });
+
+  assert.equal(normalized.takes.length, 1);
+  const take = normalized.takes[0];
+  assert.equal(take.notes.length, 1);
+  assert.equal(take.notes[0].padIndex, 15);
+  assert.equal(take.notes[0].startTime, 0);
+  assert.ok(take.notes[0].duration >= 0.02);
+  assert.equal(take.automation.length, 8);
+  assert.equal(take.automation[0][0].time, 0.2);
+  assert.equal(take.automation[0][0].value, 0);
+  assert.equal(take.automation[0][1].value, 1);
+  assert.equal(take.automation[7].length, 2);
+  assert.equal(normalized.midiMap.padNotes[0], 60);
+});
+
+test('F1 HID Protocol: 7-seg glyphs (SN/RE/ED/PF/PB), BRG pad byte order, 3-digit hex, and encoder wraparound', () => {
+  // 3-digit hex expansion
+  const c3 = hexToF1Rgb('#f08', 1.0);
+  const c6 = hexToF1Rgb('#ff0088', 1.0);
+  assert.deepEqual(c3, c6);
+
+  // 'SN' snapshot display should light segments on both left and right digits
+  const snPayload = buildF1HidOutputPayload({
+    displayText: 'SN',
+    padColors: ['#ff0080', ...Array(15).fill('#000000')],
+    activePads: [true, ...Array(15).fill(false)]
+  });
+  const leftLit = snPayload.slice(0, 7).some((v) => v > 0);
+  const rightLit = snPayload.slice(8, 15).some((v) => v > 0);
+  assert.equal(leftLit, true);
+  assert.equal(rightLit, true);
+
+  // Default BRG byte order for Pad 1 (#ff0080 -> R=0x7f, G=0x00, B=0x40 -> bytes [B, R, G])
+  assert.equal(snPayload[24], 0x40); // B
+  assert.equal(snPayload[25], 0x7f); // R
+  assert.equal(snPayload[26], 0x00); // G
+
+  // Explicit RGB option
+  const rgbPayload = buildF1HidOutputPayload({
+    padColorOrder: 'rgb',
+    padColors: ['#ff0080', ...Array(15).fill('#000000')],
+    activePads: [true, ...Array(15).fill(false)]
+  });
+  assert.equal(rgbPayload[24], 0x7f); // R
+  assert.equal(rgbPayload[25], 0x00); // G
+  assert.equal(rgbPayload[26], 0x40); // B
+
+  // Encoder wraparound 255 -> 0 (+1) and 0 -> 255 (-1)
+  const pktZero = new Uint8Array(21);
+  pktZero[4] = 0;
+  assert.equal(parseF1HidInputReport(pktZero, 255).encoderDelta, 1);
+
+  const pkt255 = new Uint8Array(21);
+  pkt255[4] = 255;
+  assert.equal(parseF1HidInputReport(pkt255, 0).encoderDelta, -1);
+});
+
+test('Timeline Engine: sliceTakeNote scales slipOffset by speed, oneshot pads ignore padUp, and mergeAutomationOverdub splices cleanly', () => {
+  const notes = [{ id: 'n1', padIndex: 8, startTime: 1.0, duration: 2.0, slipOffset: 0.5, reverse: false }];
+  const sliced = sliceTakeNote(notes, 'n1', 1.75, 2.0);
+  assert.equal(sliced.length, 2);
+  assert.equal(sliced[0].duration, 0.75);
+  assert.equal(sliced[1].startTime, 1.75);
+  assert.equal(sliced[1].duration, 1.25);
+  // 0.5 original slip + 0.75 timeline sec * 2.0 speed = 2.0s clip time
+  assert.equal(sliced[1].slipOffset, 2.0);
+
+  // One-shot trigger mode should not truncate note on padUp
+  const proj = createDefaultProject();
+  proj.pads[0].triggerMode = 'oneshot';
+  const rec = new PerformanceRecorder(proj, 'OneShot Test');
+  rec.recordPadDown(0, 0.0);
+  rec.recordPadUp(0, 0.06);
+  const take = rec.finalize(4.0);
+  assert.equal(take.notes.length, 1);
+  assert.ok(take.notes[0].duration > 0.5);
+
+  // mergeAutomationOverdub replaces points inside [1.0, 2.0] and keeps outside points
+  const baseLane = [
+    { time: 0.0, value: 0.1 },
+    { time: 1.5, value: 0.9 },
+    { time: 3.0, value: 0.2 }
+  ];
+  const merged = mergeAutomationOverdub(baseLane, [{ time: 1.5, value: 0.4 }], 1.0, 2.0);
+  assert.deepEqual(merged, [
+    { time: 0.0, value: 0.1 },
+    { time: 1.5, value: 0.4 },
+    { time: 3.0, value: 0.2 }
+  ]);
 });

@@ -339,6 +339,17 @@ html, body {
   color: #ffffff;
 }
 
+.hud-pill.toast {
+  background: rgba(20, 26, 42, 0.94);
+  border-color: var(--accent-amber);
+  color: var(--accent-amber);
+}
+
+.hud-pill.toast.error {
+  border-color: var(--accent-pink);
+  color: #ffd6e0;
+}
+
 .stage-telemetry {
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
@@ -1047,12 +1058,33 @@ input[type="range"] {
 }
 
 #f1-7seg-text {
+  position: relative;
   font-family: var(--font-mono);
   font-size: 21px;
   font-weight: 900;
   letter-spacing: 3px;
   color: #ff2644;
   text-shadow: 0 0 8px rgba(255, 38, 68, 0.85);
+}
+
+#f1-7seg-text.dot-left::before,
+#f1-7seg-text.dot-right::after {
+  content: '';
+  position: absolute;
+  bottom: 3px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ff2644;
+  box-shadow: 0 0 6px #ff2644;
+}
+
+#f1-7seg-text.dot-left::before {
+  left: -6px;
+}
+
+#f1-7seg-text.dot-right::after {
+  right: -4px;
 }
 
 .f1-encoder-wrap {

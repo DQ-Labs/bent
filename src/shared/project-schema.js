@@ -500,7 +500,7 @@ export function createDefaultProject() {
       bpm: 128,
       beatOffset: 0.0,
       duration: 15.0,
-      quantizeGrid: '1/4' // 'bar', '1/2', '1/4', '1/8', '1/16', '1/32', 'off'
+      quantizeGrid: '1/16' // 'bar', '1/2', '1/4', '1/8', '1/16', '1/32', 'off'
     },
     macros: GLOBAL_MACROS.map((m) => ({
       index: m.index,
@@ -563,10 +563,66 @@ export function validateAndNormalizeProject(raw) {
   }
 
   if (Array.isArray(raw.takes) && raw.takes.length > 0) {
-    merged.takes = raw.takes;
-    if (!merged.takes.some((t) => t.id === merged.activeTakeId)) {
-      merged.activeTakeId = merged.takes[0].id;
+    const validTakes = raw.takes
+      .filter((t) => t && typeof t === 'object')
+      .map((t, idx) => {
+        const takeDuration = Math.max(0.5, Number(t.duration) || merged.audio.duration || 15.0);
+        const takeBpm = Math.max(40, Math.min(260, Number(t.bpm) || merged.audio.bpm || 128));
+        const rawNotes = Array.isArray(t.notes) ? t.notes : [];
+        const notes = rawNotes
+          .filter((n) => n && typeof n === 'object')
+          .map((n, nIdx) => ({
+            id: typeof n.id === 'string' && n.id ? n.id : `take-${idx}-n${nIdx + 1}`,
+            padIndex: Math.max(0, Math.min(15, Math.floor(Number(n.padIndex) || 0))),
+            startTime: Math.max(0, Number(n.startTime) || 0),
+            duration: Math.max(0.02, Number(n.duration) || 0.25),
+            slipOffset: Math.max(0, Number(n.slipOffset) || 0),
+            reverse: Boolean(n.reverse)
+          }));
+
+        const rawAuto = Array.isArray(t.automation) ? t.automation : [];
+        const automation = Array.from({ length: 8 }, (_, m) => {
+          const defVal = GLOBAL_MACROS[m].defaultValue;
+          const lane = Array.isArray(rawAuto[m]) ? rawAuto[m] : null;
+          if (!lane || lane.length === 0) {
+            return [
+              { time: 0.0, value: defVal },
+              { time: takeDuration, value: defVal }
+            ];
+          }
+          const cleaned = lane
+            .filter((p) => p && typeof p === 'object' && Number.isFinite(Number(p.time)))
+            .map((p) => ({
+              time: Math.max(0, Number(p.time)),
+              value: Math.max(0, Math.min(1, Number(p.value) || 0))
+            }))
+            .sort((a, b) => a.time - b.time);
+          return cleaned.length > 0
+            ? cleaned
+            : [{ time: 0.0, value: defVal }, { time: takeDuration, value: defVal }];
+        });
+
+        return {
+          id: typeof t.id === 'string' && t.id ? t.id : `take-${idx + 1}`,
+          name: typeof t.name === 'string' && t.name ? t.name : `Take ${idx + 1}`,
+          createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString(),
+          duration: takeDuration,
+          bpm: takeBpm,
+          notes,
+          automation
+        };
+      });
+
+    if (validTakes.length > 0) {
+      merged.takes = validTakes;
+      if (!merged.takes.some((t) => t.id === merged.activeTakeId)) {
+        merged.activeTakeId = merged.takes[0].id;
+      }
     }
+  }
+
+  if (raw.midiMap && typeof raw.midiMap === 'object') {
+    merged.midiMap = raw.midiMap;
   }
 
   return merged;

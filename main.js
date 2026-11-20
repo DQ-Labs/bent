@@ -10,6 +10,46 @@ const __dirname = path.dirname(__filename);
 const NI_VENDOR_ID = 0x17cc;
 const F1_PRODUCT_ID = 0x1120;
 
+const ALLOWED_MEDIA_EXTS = new Set([
+  '.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v',
+  '.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac'
+]);
+
+const ALLOWED_PERMISSIONS = new Set(['midi', 'midiSysex', 'hid']);
+
+// Main-process allowlists of user-approved local file paths
+const allowedMediaPaths = new Set();
+const allowedProjectPaths = new Set();
+
+function normalizePathKey(filePath) {
+  const resolved = path.resolve(String(filePath));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function registerAllowedMediaPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return;
+  const resolved = path.resolve(filePath);
+  const ext = path.extname(resolved).toLowerCase();
+  if (ALLOWED_MEDIA_EXTS.has(ext)) {
+    allowedMediaPaths.add(normalizePathKey(resolved));
+  }
+}
+
+function isAllowedMediaPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return false;
+  return allowedMediaPaths.has(normalizePathKey(filePath));
+}
+
+function registerAllowedProjectPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return;
+  allowedProjectPaths.add(normalizePathKey(filePath));
+}
+
+function isAllowedProjectPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return false;
+  return allowedProjectPaths.has(normalizePathKey(filePath));
+}
+
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'bent-media',
@@ -17,8 +57,7 @@ protocol.registerSchemesAsPrivileged([
       standard: true,
       secure: true,
       supportFetchAPI: true,
-      stream: true,
-      bypassCSP: true
+      stream: true
     }
   }
 ]);
@@ -38,33 +77,24 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
       backgroundThrottling: false
     }
   });
 
   const ses = mainWindow.webContents.session;
 
-  // Automatically grant WebMIDI & WebHID permissions for the Traktor Kontrol F1
+  // Grant ONLY WebMIDI & WebHID permissions for the Traktor Kontrol F1
   ses.setPermissionCheckHandler((_webContents, permission) => {
-    if (permission === 'midi' || permission === 'midiSysex' || permission === 'hid') {
-      return true;
-    }
-    return true;
+    return ALLOWED_PERMISSIONS.has(permission);
   });
 
   ses.setPermissionRequestHandler((_webContents, permission, callback) => {
-    if (permission === 'midi' || permission === 'midiSysex' || permission === 'hid') {
-      callback(true);
-      return;
-    }
-    callback(true);
+    callback(ALLOWED_PERMISSIONS.has(permission));
   });
 
   ses.setDevicePermissionHandler((details) => {
-    if (details.deviceType === 'hid') {
-      return true;
-    }
-    return true;
+    return details.deviceType === 'hid';
   });
 
   // When navigator.hid.requestDevice() is called, automatically pick the Traktor Kontrol F1
@@ -127,14 +157,17 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  // Stream local video & audio files cleanly via bent-media://local?path=...
+  // Stream approved local video & audio files via bent-media://local?path=...
   protocol.handle('bent-media', (request) => {
     const reqUrl = new URL(request.url);
     const filePath = reqUrl.searchParams.get('path');
     if (!filePath) {
       return new Response('Missing file path', { status: 400 });
     }
-    const fileUrl = pathToFileURL(filePath).toString();
+    if (!isAllowedMediaPath(filePath)) {
+      return new Response('Forbidden media path', { status: 403 });
+    }
+    const fileUrl = pathToFileURL(path.resolve(filePath)).toString();
     return net.fetch(fileUrl, {
       headers: request.headers
     });
@@ -167,11 +200,14 @@ ipcMain.handle('bent:pick-videos', async () => {
   if (result.canceled || !result.filePaths.length) {
     return [];
   }
-  return result.filePaths.map((fp) => ({
-    path: fp,
-    name: path.basename(fp),
-    mediaUrl: `bent-media://local?path=${encodeURIComponent(fp)}`
-  }));
+  return result.filePaths.map((fp) => {
+    registerAllowedMediaPath(fp);
+    return {
+      path: fp,
+      name: path.basename(fp),
+      mediaUrl: `bent-media://local?path=${encodeURIComponent(fp)}`
+    };
+  });
 });
 
 ipcMain.handle('bent:pick-audio', async () => {
@@ -186,16 +222,23 @@ ipcMain.handle('bent:pick-audio', async () => {
     return null;
   }
   const fp = result.filePaths[0];
-  const buffer = await fs.readFile(fp);
-  return {
-    path: fp,
-    name: path.basename(fp),
-    mediaUrl: `bent-media://local?path=${encodeURIComponent(fp)}`,
-    arrayBuffer: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
-  };
+  try {
+    await fs.access(fp);
+    registerAllowedMediaPath(fp);
+    return {
+      path: fp,
+      name: path.basename(fp),
+      mediaUrl: `bent-media://local?path=${encodeURIComponent(fp)}`
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
 });
 
 ipcMain.handle('bent:read-audio-path', async (_event, fp) => {
+  if (!isAllowedMediaPath(fp)) {
+    return { error: 'Audio path is not in the approved media allowlist.' };
+  }
   try {
     const buffer = await fs.readFile(fp);
     return {
@@ -210,7 +253,7 @@ ipcMain.handle('bent:read-audio-path', async (_event, fp) => {
 });
 
 ipcMain.handle('bent:save-project', async (_event, { jsonString, currentPath }) => {
-  let targetPath = currentPath;
+  let targetPath = isAllowedProjectPath(currentPath) ? currentPath : null;
   if (!targetPath) {
     const res = await dialog.showSaveDialog(mainWindow, {
       title: 'Save Bent Project',
@@ -222,8 +265,13 @@ ipcMain.handle('bent:save-project', async (_event, { jsonString, currentPath }) 
     }
     targetPath = res.filePath;
   }
-  await fs.writeFile(targetPath, jsonString, 'utf8');
-  return { canceled: false, filePath: targetPath };
+  try {
+    await fs.writeFile(targetPath, String(jsonString), 'utf8');
+    registerAllowedProjectPath(targetPath);
+    return { canceled: false, filePath: targetPath };
+  } catch (err) {
+    return { canceled: false, error: err.message };
+  }
 });
 
 ipcMain.handle('bent:open-project', async () => {
@@ -236,6 +284,27 @@ ipcMain.handle('bent:open-project', async () => {
     return { canceled: true };
   }
   const filePath = res.filePaths[0];
-  const content = await fs.readFile(filePath, 'utf8');
-  return { canceled: false, filePath, content };
+  try {
+    const content = await fs.readFile(filePath, 'utf8');
+    registerAllowedProjectPath(filePath);
+    // Register any referenced media paths inside the user-opened project so bent-media:// can stream them
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed?.audio?.filePath) {
+        registerAllowedMediaPath(parsed.audio.filePath);
+      }
+      if (Array.isArray(parsed?.clips)) {
+        for (const clip of parsed.clips) {
+          if (clip?.sourceType === 'file' && clip?.filePath) {
+            registerAllowedMediaPath(clip.filePath);
+          }
+        }
+      }
+    } catch (_parseErr) {
+      // Renderer will report JSON parse error to the user
+    }
+    return { canceled: false, filePath, content };
+  } catch (err) {
+    return { canceled: false, error: err.message };
+  }
 });

@@ -24,6 +24,7 @@ uniform sampler2D u_moshTex;
 
 uniform vec2 u_resolution;
 uniform float u_time;
+uniform float u_dt;
 uniform float u_macros[8]; // 0..3 = Knobs 1..4, 4..7 = Faders 1..4
 uniform vec4 u_fft;        // x=sub, y=kick, z=mid, w=high
 uniform float u_columnKill[4]; // 1.0 if column killed/bypassed
@@ -198,12 +199,13 @@ void main() {
 
   // --- COLUMN 3A & 3B: Dirty Video Mixer Ping-Pong Feedback Loop ---
   if (mFbackMix > 0.005) {
+    float dtScale = clamp(u_dt * 60.0, 0.25, 2.5);
     vec2 center = vec2(0.5);
     vec2 d = v_uv - center;
 
-    // Feedback Warp controls zoom + spin + wave ripple inside feedback loop
-    float zoom = 1.0 - (mFbackWarp - 0.25) * 0.065 - u_fft.y * 0.015 * mFbackMix;
-    float angle = (mFbackWarp - 0.25) * 0.08 * sin(u_time * 0.8);
+    // Feedback Warp controls zoom + spin + wave ripple inside feedback loop (normalized to 60 FPS)
+    float zoom = 1.0 - ((mFbackWarp - 0.25) * 0.065 + u_fft.y * 0.015 * mFbackMix) * dtScale;
+    float angle = (mFbackWarp - 0.25) * 0.08 * sin(u_time * 0.8) * dtScale;
     float ca = cos(angle);
     float sa = sin(angle);
     vec2 warpedUv = center + mat2(ca, -sa, sa, ca) * (d * zoom);
@@ -212,18 +214,18 @@ void main() {
 
     // Hue drift inside feedback loop
     vec3 fbYiq = rgb2yiq(fbColor);
-    float hueDrift = 0.06 + mFbackWarp * 0.22;
+    float hueDrift = (0.06 + mFbackWarp * 0.22) * dtScale;
     float ch = cos(hueDrift);
     float sh = sin(hueDrift);
     fbYiq.yz = mat2(ch, -sh, sh, ch) * fbYiq.yz;
-    fbColor = clamp(yiq2rgb(fbYiq) * 0.985, 0.0, 1.0);
+    float decay = pow(0.985, dtScale);
+    fbColor = clamp(yiq2rgb(fbYiq) * decay, 0.0, 1.0);
 
     // Dirty mixer luma-key / cross-modulation blend
-    float fbLuma = dot(fbColor, vec3(0.299, 0.587, 0.114));
     float srcLuma = dot(srcColor, vec3(0.299, 0.587, 0.114));
     vec3 dirtyBlend = mix(srcColor, abs(srcColor - fbColor * 0.85) + fbColor * 0.55, mFbackMix);
     float lumaKey = smoothstep(0.08, 0.85, srcLuma);
-    vec3 trailBlend = mix(fbColor * 0.96, srcColor, mix(1.0, lumaKey, mFbackMix * 0.78));
+    vec3 trailBlend = mix(fbColor * pow(0.96, dtScale), srcColor, mix(1.0, lumaKey, mFbackMix * 0.78));
 
     srcColor = clamp(mix(trailBlend, dirtyBlend, mFbackWarp * 0.65), 0.0, 1.0);
   }
@@ -307,12 +309,13 @@ function createFboTexturePair(gl, width, height) {
 }
 
 export class WebGLVideoBender {
-  constructor(canvas) {
+  constructor(canvas, options = {}) {
     this.canvas = canvas;
+    this.onClipMetadataLoaded = options.onClipMetadataLoaded || null;
     this.gl = canvas.getContext('webgl2', {
       alpha: false,
       antialias: false,
-      preserveDrawingBuffer: true
+      preserveDrawingBuffer: false
     });
 
     if (!this.gl) {
@@ -323,6 +326,7 @@ export class WebGLVideoBender {
     this.height = 720;
     this.internalWidth = 960;
     this.internalHeight = 540;
+    this._contextLost = false;
 
     // Offscreen 2D canvas used to render procedural sources & frame-fitted HTML5 <video> clips
     this.sourceCanvas = document.createElement('canvas');
@@ -331,16 +335,57 @@ export class WebGLVideoBender {
     this.sourceCtx = this.sourceCanvas.getContext('2d', { alpha: false });
 
     this.videoElements = new Map(); // clip.id -> HTMLVideoElement
+    this._activeVideoClipId = null;
     this.columnKill = [0, 0, 0, 0];
     this.moshFrozen = false;
 
+    // Pre-allocated uniform upload buffers to avoid per-frame GC churn
+    this._macrosBuf = new Float32Array(8);
+    this._columnKillBuf = new Float32Array(4);
+    this._sourceTexInitialized = false;
+
     this._initGl();
+    this._bindContextEvents();
+  }
+
+  _bindContextEvents() {
+    this.canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      this._contextLost = true;
+    });
+    this.canvas.addEventListener('webglcontextrestored', () => {
+      this._contextLost = false;
+      this.fboA = null;
+      this.fboB = null;
+      this.moshFbo = null;
+      this._sourceTexInitialized = false;
+      this._initGl();
+      this.clearFeedbackBuffers();
+    });
   }
 
   _initGl() {
     const gl = this.gl;
     this.bendProgram = createProgram(gl, VERTEX_SHADER_SRC, BEND_FRAGMENT_SHADER_SRC);
     this.displayProgram = createProgram(gl, VERTEX_SHADER_SRC, DISPLAY_FRAGMENT_SHADER_SRC);
+
+    // Cache uniform locations once instead of querying every frame
+    this._bendLocs = {
+      sourceTex: gl.getUniformLocation(this.bendProgram, 'u_sourceTex'),
+      feedbackTex: gl.getUniformLocation(this.bendProgram, 'u_feedbackTex'),
+      moshTex: gl.getUniformLocation(this.bendProgram, 'u_moshTex'),
+      resolution: gl.getUniformLocation(this.bendProgram, 'u_resolution'),
+      time: gl.getUniformLocation(this.bendProgram, 'u_time'),
+      dt: gl.getUniformLocation(this.bendProgram, 'u_dt'),
+      macros: gl.getUniformLocation(this.bendProgram, 'u_macros[0]'),
+      fft: gl.getUniformLocation(this.bendProgram, 'u_fft'),
+      columnKill: gl.getUniformLocation(this.bendProgram, 'u_columnKill[0]')
+    };
+    this._displayLocs = {
+      renderedTex: gl.getUniformLocation(this.displayProgram, 'u_renderedTex'),
+      resolution: gl.getUniformLocation(this.displayProgram, 'u_resolution'),
+      crtEmulation: gl.getUniformLocation(this.displayProgram, 'u_crtEmulation')
+    };
 
     // Fullscreen quad VAO
     const quadVerts = new Float32Array([
@@ -367,6 +412,12 @@ export class WebGLVideoBender {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA,
+      this.internalWidth, this.internalHeight, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, null
+    );
+    this._sourceTexInitialized = true;
 
     this._allocateFbos(this.internalWidth, this.internalHeight);
   }
@@ -384,6 +435,7 @@ export class WebGLVideoBender {
     this.fboA = createFboTexturePair(gl, w, h);
     this.fboB = createFboTexturePair(gl, w, h);
     this.moshFbo = createFboTexturePair(gl, w, h);
+    this.moshFrozen = false;
   }
 
   setCanvasResolution(width, height) {
@@ -395,14 +447,22 @@ export class WebGLVideoBender {
 
     // Keep source generator resolution proportional and fast
     const scale = width > 1280 ? 0.5 : 0.75;
-    this.internalWidth = Math.max(320, Math.round(width * scale));
-    this.internalHeight = Math.max(240, Math.round(height * scale));
-    this.sourceCanvas.width = this.internalWidth;
-    this.sourceCanvas.height = this.internalHeight;
-    this._allocateFbos(this.internalWidth, this.internalHeight);
+    const nextW = Math.max(320, Math.round(width * scale));
+    const nextH = Math.max(240, Math.round(height * scale));
+    if (nextW !== this.internalWidth || nextH !== this.internalHeight) {
+      this.internalWidth = nextW;
+      this.internalHeight = nextH;
+      this.sourceCanvas.width = this.internalWidth;
+      this.sourceCanvas.height = this.internalHeight;
+      this._sourceTexInitialized = false;
+      if (!this._contextLost) {
+        this._allocateFbos(this.internalWidth, this.internalHeight);
+      }
+    }
   }
 
   clearFeedbackBuffers() {
+    if (this._contextLost) return;
     const gl = this.gl;
     for (const target of [this.fboA, this.fboB, this.moshFbo]) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
@@ -410,6 +470,34 @@ export class WebGLVideoBender {
       gl.clear(gl.COLOR_BUFFER_BIT);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.moshFrozen = false;
+  }
+
+  /**
+   * Release all cached <video> elements (e.g. when loading a new project).
+   */
+  disposeVideoElements() {
+    for (const vid of this.videoElements.values()) {
+      try {
+        vid.pause();
+        vid.removeAttribute('src');
+        vid.load();
+      } catch (_e) {
+        // Ignore teardown errors
+      }
+    }
+    this.videoElements.clear();
+    this._activeVideoClipId = null;
+  }
+
+  _pauseInactiveVideos(activeClipId) {
+    if (this._activeVideoClipId === activeClipId) return;
+    for (const [id, vid] of this.videoElements.entries()) {
+      if (id !== activeClipId && !vid.paused) {
+        vid.pause();
+      }
+    }
+    this._activeVideoClipId = activeClipId;
   }
 
   /**
@@ -426,17 +514,27 @@ export class WebGLVideoBender {
       vid.playsInline = true;
       vid.crossOrigin = 'anonymous';
       vid.preload = 'auto';
-      vid.src = url;
+      if (url) {
+        vid.src = url;
+        vid.setAttribute('data-src', url);
+      }
       vid.addEventListener('loadedmetadata', () => {
         if (vid.duration && Number.isFinite(vid.duration)) {
-          clip.duration = Number(vid.duration.toFixed(2));
-          if (!clip.outPoint || clip.outPoint > clip.duration) {
-            clip.outPoint = clip.duration;
+          const prevDur = clip.duration;
+          const realDur = Number(vid.duration.toFixed(2));
+          clip.duration = realDur;
+          // Expand outPoint when replacing the initial placeholder duration, or clamp if outPoint exceeds real duration
+          if (!clip.outPoint || clip.outPoint >= prevDur - 0.05 || clip.outPoint > realDur) {
+            clip.outPoint = realDur;
           }
+          if (clip.inPoint >= clip.outPoint) {
+            clip.inPoint = 0;
+          }
+          this.onClipMetadataLoaded?.(clip);
         }
       });
       this.videoElements.set(clip.id, vid);
-    } else if (vid.getAttribute('data-src') !== url && url) {
+    } else if (url && vid.getAttribute('data-src') !== url) {
       vid.src = url;
       vid.setAttribute('data-src', url);
     }
@@ -450,56 +548,73 @@ export class WebGLVideoBender {
     clip,
     clipTime = 0,
     globalTime = 0,
+    dt = 1 / 60,
     macros = [0, 0, 0.25, 0, 0, 0, 0, 0],
     fft = { sub: 0, kick: 0, mid: 0, high: 0 },
     aspectFit = 'cover',
     crtEmulation = true,
-    isScrubbing = false
+    isScrubbing = false,
+    playbackSpeed = 1.0,
+    isReversed = false
   }) {
+    if (this._contextLost) return;
+
     // 1. Draw the current video frame (procedural or local file) onto this.sourceCanvas
-    this._drawSourceFrame(clip, clipTime, fft, aspectFit, isScrubbing);
+    this._drawSourceFrame(clip, clipTime, fft, aspectFit, isScrubbing, playbackSpeed, isReversed);
 
     // 2. Upload this.sourceCanvas to this.sourceTex
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.sourceCanvas);
+    if (this._sourceTexInitialized) {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.sourceCanvas);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.sourceCanvas);
+      this._sourceTexInitialized = true;
+    }
 
     // 3. Execute Pass 1 (Circuit-Bend Shader) into fboA reading fboB as feedback
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboA.fbo);
     gl.viewport(0, 0, this.internalWidth, this.internalHeight);
     gl.useProgram(this.bendProgram);
 
+    const locs = this._bendLocs;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
-    gl.uniform1i(gl.getUniformLocation(this.bendProgram, 'u_sourceTex'), 0);
+    gl.uniform1i(locs.sourceTex, 0);
 
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.fboB.tex);
-    gl.uniform1i(gl.getUniformLocation(this.bendProgram, 'u_feedbackTex'), 1);
+    gl.uniform1i(locs.feedbackTex, 1);
 
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, this.moshFbo.tex);
-    gl.uniform1i(gl.getUniformLocation(this.bendProgram, 'u_moshTex'), 2);
+    gl.uniform1i(locs.moshTex, 2);
 
-    gl.uniform2f(gl.getUniformLocation(this.bendProgram, 'u_resolution'), this.internalWidth, this.internalHeight);
-    gl.uniform1f(gl.getUniformLocation(this.bendProgram, 'u_time'), globalTime);
-    gl.uniform1fv(gl.getUniformLocation(this.bendProgram, 'u_macros[0]'), new Float32Array(macros));
+    gl.uniform2f(locs.resolution, this.internalWidth, this.internalHeight);
+    gl.uniform1f(locs.time, globalTime);
+    gl.uniform1f(locs.dt, dt);
+
+    for (let i = 0; i < 8; i++) this._macrosBuf[i] = macros[i] || 0;
+    gl.uniform1fv(locs.macros, this._macrosBuf);
+
     gl.uniform4f(
-      gl.getUniformLocation(this.bendProgram, 'u_fft'),
+      locs.fft,
       fft.sub || 0,
       fft.kick || 0,
       fft.mid || 0,
       fft.high || 0
     );
-    gl.uniform1fv(gl.getUniformLocation(this.bendProgram, 'u_columnKill[0]'), new Float32Array(this.columnKill));
+
+    for (let i = 0; i < 4; i++) this._columnKillBuf[i] = this.columnKill[i] || 0;
+    gl.uniform1fv(locs.columnKill, this._columnKillBuf);
 
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // 4. Update Datamosh Reference FBO whenever Fader 4 (datamoshHold) is low (< 0.15)
+    // 4. Update Datamosh Reference FBO whenever effective Fader 4 (datamoshHold) is low (< 0.12)
     // so raising Fader 4 freezes the last clean frame and smears motion across it!
-    const moshAmount = macros[7] || 0;
-    if (moshAmount < 0.12 || !this.moshFrozen) {
+    const effectiveMosh = (macros[7] || 0) * (1.0 - (this.columnKill[3] || 0));
+    if (effectiveMosh < 0.12 || !this.moshFrozen) {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.fboA.fbo);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.moshFbo.fbo);
       gl.blitFramebuffer(
@@ -507,7 +622,7 @@ export class WebGLVideoBender {
         0, 0, this.internalWidth, this.internalHeight,
         gl.COLOR_BUFFER_BIT, gl.NEAREST
       );
-      this.moshFrozen = moshAmount >= 0.12;
+      this.moshFrozen = effectiveMosh >= 0.12;
     }
 
     // 5. Execute Pass 2 (CRT Display Post-Process) to main screen canvas
@@ -515,11 +630,12 @@ export class WebGLVideoBender {
     gl.viewport(0, 0, this.width, this.height);
     gl.useProgram(this.displayProgram);
 
+    const dLocs = this._displayLocs;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.fboA.tex);
-    gl.uniform1i(gl.getUniformLocation(this.displayProgram, 'u_renderedTex'), 0);
-    gl.uniform2f(gl.getUniformLocation(this.displayProgram, 'u_resolution'), this.width, this.height);
-    gl.uniform1i(gl.getUniformLocation(this.displayProgram, 'u_crtEmulation'), crtEmulation ? 1 : 0);
+    gl.uniform1i(dLocs.renderedTex, 0);
+    gl.uniform2f(dLocs.resolution, this.width, this.height);
+    gl.uniform1i(dLocs.crtEmulation, crtEmulation ? 1 : 0);
 
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.bindVertexArray(null);
@@ -530,7 +646,7 @@ export class WebGLVideoBender {
     this.fboB = temp;
   }
 
-  _drawSourceFrame(clip, clipTime, fft, aspectFit, isScrubbing) {
+  _drawSourceFrame(clip, clipTime, fft, aspectFit, isScrubbing, playbackSpeed = 1.0, isReversed = false) {
     const ctx = this.sourceCtx;
     const w = this.internalWidth;
     const h = this.internalHeight;
@@ -540,6 +656,7 @@ export class WebGLVideoBender {
     ctx.fillRect(0, 0, w, h);
 
     if (!clip) {
+      this._pauseInactiveVideos(null);
       this._drawProceduralPM5544(ctx, w, h, clipTime, fft);
       ctx.restore();
       return;
@@ -556,24 +673,33 @@ export class WebGLVideoBender {
     }
 
     if (clip.sourceType === 'file') {
+      this._pauseInactiveVideos(clip.id);
       const vid = this.ensureVideoElement(clip);
       if (vid && vid.readyState >= 2) {
-        if (Math.abs(vid.currentTime - clipTime) > (isScrubbing ? 0.04 : 0.25)) {
+        const shouldSeekMode = isScrubbing || isReversed;
+        const safeRate = Math.max(0.25, Math.min(4.0, Number(playbackSpeed) || 1.0));
+        if (!shouldSeekMode && Math.abs(vid.playbackRate - safeRate) > 0.02) {
+          vid.playbackRate = safeRate;
+        }
+        const seekThreshold = shouldSeekMode ? 0.035 : 0.25;
+        if (Math.abs(vid.currentTime - clipTime) > seekThreshold && !vid.seeking) {
           try {
             vid.currentTime = clipTime;
           } catch (_e) {
             // Ignore seek race
           }
         }
-        if (vid.paused && !isScrubbing) {
+        if (vid.paused && !shouldSeekMode) {
           vid.play().catch(() => {});
-        } else if (!vid.paused && isScrubbing) {
+        } else if (!vid.paused && shouldSeekMode) {
           vid.pause();
         }
         this._drawMediaWithAspectFit(ctx, vid, vid.videoWidth || w, vid.videoHeight || h, w, h, aspectFit);
         ctx.restore();
         return;
       }
+    } else {
+      this._pauseInactiveVideos(null);
     }
 
     // Procedural Analog Video Synth Sources (deterministic at clipTime!)

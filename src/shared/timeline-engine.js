@@ -230,24 +230,33 @@ export class PerformanceRecorder {
       this._closeOpenNote(padIndex, time);
     }
 
+    const clip = this.project?.clips?.find((c) => c.id === pad.clipId);
+    const clipSpan = clip
+      ? Math.max(0.1, (Number(clip.outPoint) || Number(clip.duration) || 4.0) - (Number(clip.inPoint) || 0))
+      : gridDivisionToSeconds(this.bpm, 'bar');
+    const padSpeed = Math.max(0.05, (Number(clip?.speed) || 1.0) * (Number(pad.speedMultiplier) || 1.0));
+    const oneShotDur = Math.max(0.1, Math.min(clipSpan / padSpeed, gridDivisionToSeconds(this.bpm, 'bar')));
+
     const note = {
       id: `${this.takeId}-n${this.noteCounter++}`,
       padIndex,
       startTime: time,
-      duration: 0.25,
+      duration: pad.triggerMode === 'oneshot' ? Number(oneShotDur.toFixed(4)) : 0.25,
       slipOffset: 0.0,
       reverse: Boolean(options.reverse)
     };
 
     this.notes.push(note);
-    this.openNotesByPad.set(padIndex, note);
+    if (pad.triggerMode !== 'oneshot') {
+      this.openNotesByPad.set(padIndex, note);
+    }
   }
 
   recordPadUp(padIndex, rawTime) {
     const pad = this.project?.pads?.[padIndex];
     if (!pad) return;
-    // Latched pads remain active until switched or explicitly stopped
-    if (pad.triggerMode === 'latch') {
+    // Latched and one-shot pads are not truncated on release
+    if (pad.triggerMode === 'latch' || pad.triggerMode === 'oneshot') {
       return;
     }
     this._closeOpenNote(padIndex, rawTime);
@@ -328,8 +337,10 @@ export function quantizeTakeNotes(notes, bpm, division = '1/16', selectedIds = n
 
 /**
  * Slice a Piano Roll note at `sliceTime` into two independent blocks, preserving internal video continuity.
+ * Pass `speedMultiplier` (clip.speed * pad.speedMultiplier) so slipOffset advances in clip-time seconds.
  */
-export function sliceTakeNote(notes, noteId, sliceTime) {
+export function sliceTakeNote(notes, noteId, sliceTime, speedMultiplier = 1.0) {
+  const safeSpeed = Math.max(0.05, Number(speedMultiplier) || 1.0);
   const out = [];
   for (const n of notes) {
     if (n.id !== noteId) {
@@ -352,7 +363,7 @@ export function sliceTakeNote(notes, noteId, sliceTime) {
       id: `${n.id}-s${Math.round(sliceTime * 1000)}`,
       startTime: Number(sliceTime.toFixed(4)),
       duration: secondDur,
-      slipOffset: Number(((n.slipOffset || 0) + firstDur).toFixed(4))
+      slipOffset: Number(((n.slipOffset || 0) + firstDur * safeSpeed).toFixed(4))
     });
   }
   return out;
